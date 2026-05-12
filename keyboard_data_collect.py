@@ -137,6 +137,30 @@ class DataRecorder:
         self.is_recording = False
         print("\n⏸️  暂停录制")
 
+    def reset_recording(self):
+        """重置录制，清空所有已录数据"""
+        self.is_recording = False
+        self.rgb_timestamps = []
+        self.depth_frames = []
+        self.depth_timestamps = []
+        self.joint_states = []
+        self.joint_timestamps = []
+        self.commanded_states = []
+        self.commanded_timestamps = []
+        self.num_frames = 0
+        self.record_start_time = None
+
+        # 重新创建视频录制器
+        self.video_writer.release()
+        video_path = os.path.join(self.storage_path, 'cam_0_rgb_video.avi')
+        self.video_writer = cv2.VideoWriter(
+            video_path,
+            cv2.VideoWriter_fourcc(*'XVID'),
+            SIM_FPS,
+            IMAGE_SIZE
+        )
+        print("\n🔄 录制已重置! 按 SPACE 重新开始录制")
+
     def record_frame(self, rgb_image, depth_image, actual_joints, commanded_joints, sim_time):
         """录制一帧数据"""
         if not self.is_recording:
@@ -271,6 +295,9 @@ def create_sim():
     gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_C, "close")
     gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_G, "grasp")
     gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_SPACE, "toggle_record")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_T, "reset_record")
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_F, "push")  # 长按持续推
+    gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_B, "reset_scene")  # 重置整个场景
 
     # 加载资产
     asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -330,7 +357,7 @@ def create_sim():
     object_pose = gymapi.Transform()
     object_pose.p = gymapi.Vec3(1, 1.3, 0.06)
     object_pose.r = gymapi.Quat(-1.3, -0.707, 0, 0)
-    gym.create_actor(env, object_asset, object_pose, "cube", 0, 0, 0)
+    object_handle = gym.create_actor(env, object_asset, object_pose, "cube", 0, 0, 0)
 
     # 手的颜色
     num_dofs = gym.get_asset_dof_count(hand_asset)
@@ -350,7 +377,7 @@ def create_sim():
         props["driveMode"][k] = gymapi.DOF_MODE_POS
     gym.set_actor_dof_properties(env, actor_handle, props)
 
-    return gym, sim, viewer, env, actor_handle, camera_handle
+    return gym, sim, viewer, env, actor_handle, camera_handle, object_handle
 
 
 def get_camera_images(gym, sim, env, camera_handle):
@@ -422,8 +449,8 @@ def print_status(current_finger, joint_positions, recorder):
         vals = [f"{joint_positions[j]:+.3f}" for j in joints]
         print(f"  {marker} {name}: {vals}")
     print(f"\n  操作: 1-4选指 W/S弯曲 A/D侧摆 Q/E中节 Z/X末节")
-    print(f"  动作: R重置 O张开 C握拳 G抓取")
-    print(f"  录制: SPACE开始/暂停  ESC退出并保存")
+    print(f"  动作: R重置手 O张开 C握拳 G抓取 F长按推 B重置场景")
+    print(f"  录制: SPACE开始/暂停  T重置录制  ESC退出并保存")
     print("=" * 60)
 
 
@@ -438,7 +465,12 @@ def main():
     print(f"数据将保存到: {storage_path}")
 
     # 创建仿真
-    gym, sim, viewer, env, actor_handle, camera_handle = create_sim()
+    gym, sim, viewer, env, actor_handle, camera_handle, object_handle = create_sim()
+
+    # 获取 root state tensor 用于重置方块
+    actor_root_state = gym.acquire_actor_root_state_tensor(sim)
+    root_state_tensor = gymtorch.wrap_tensor(actor_root_state).view(-1, 13)
+    object_idx = gym.get_actor_index(env, object_handle, gymapi.DOMAIN_SIM)
 
     # 创建录制器
     recorder = DataRecorder(storage_path)
@@ -455,15 +487,24 @@ def main():
     current_finger = 0
     print_status(current_finger, joint_positions, recorder)
 
+    # 长按状态
+    push_held = False
+
     # 主循环
     while not gym.query_viewer_has_closed(viewer):
         # 处理键盘事件
         events = gym.query_viewer_action_events(viewer)
         for event in events:
+            action = event.action
+
+            # 长按 F 键：按下开始推，松开停止
+            if action == "push":
+                push_held = (event.value != 0)
+                continue
+
             if event.value == 0:
                 continue
 
-            action = event.action
             joints = FINGER_JOINTS[current_finger]
             updated = False
 
@@ -514,11 +555,37 @@ def main():
                 else:
                     recorder.start_recording()
                 updated = True
+            elif action == "reset_record":
+                recorder.reset_recording()
+                updated = True
+            elif action == "reset_scene":
+                # 重置手到初始姿态
+                joint_positions = HOME_POSITION.copy()
+                commanded_positions = HOME_POSITION.copy()
+                # 重置方块到初始位置
+                root_state_tensor[object_idx, 0:3] = torch.tensor([1.0, 1.3, 0.06])
+                root_state_tensor[object_idx, 3:7] = torch.tensor([-1.3, -0.707, 0.0, 0.0])
+                root_state_tensor[object_idx, 7:13] = 0  # 清零速度
+                object_indices = torch.tensor([object_idx], dtype=torch.int32)
+                gym.set_actor_root_state_tensor_indexed(sim,
+                    gymtorch.unwrap_tensor(root_state_tensor),
+                    gymtorch.unwrap_tensor(object_indices), 1)
+                print("\n🔄 场景已重置!")
+                updated = True
 
             if updated:
                 joint_positions = np.clip(joint_positions, JOINT_LOWER, JOINT_UPPER)
                 commanded_positions = joint_positions.copy()
                 print_status(current_finger, joint_positions, recorder)
+
+        # 长按 F：持续弯曲当前手指所有关节（推动方块）
+        if push_held:
+            joints = FINGER_JOINTS[current_finger]
+            joint_positions[joints[1]] += STEP_SIZE * 0.3
+            joint_positions[joints[2]] += STEP_SIZE * 0.3
+            joint_positions[joints[3]] += STEP_SIZE * 0.2
+            joint_positions = np.clip(joint_positions, JOINT_LOWER, JOINT_UPPER)
+            commanded_positions = joint_positions.copy()
 
         # 仿真步进
         pos_tensor = torch.tensor(joint_positions, dtype=torch.float32)
