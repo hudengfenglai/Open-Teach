@@ -173,13 +173,13 @@ class AllegroHandEnv(Hand_Env):
             self.gym.add_ground(self.sim, plane_params)
 
             # create viewer (Can be used if you want to visualise the simulation)
-            #self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
+            self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
 
             #Get the camera pose and place the camera there
 
-            # if self.viewer is None:
-            #         print("*** Failed to create viewer")
-            #         quit()
+            if self.viewer is None:
+                    print("*** Failed to create viewer")
+                    quit()
 
             # set asset options
             asset_options = gymapi.AssetOptions()
@@ -496,6 +496,10 @@ class AllegroHandEnv(Hand_Env):
             self.gym.fetch_results(self.sim, True)
             self.gym.step_graphics(self.sim)
             self.gym.render_all_camera_sensors(self.sim)
+            # Render the viewer window
+            if self.viewer is not None:
+                self.gym.draw_viewer(self.viewer, self.sim, True)
+                self.gym.sync_frame_time(self.sim)
 
         
 
